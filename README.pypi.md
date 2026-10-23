@@ -64,6 +64,10 @@ To fetch data or execute functions over an actual NDN network, the following mus
 
 Without these, `interest` expressions will fall back to local data only.
 
+Remote function calls execute on the remote function endpoint first. If that
+request fails, `ndnc` falls back to locally executing a cached (or newly fetched)
+`/function-name/code` source.
+
 ## Function return values
 
 Use `return` to produce a function result. It stops execution of the current
