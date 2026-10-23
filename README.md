@@ -55,6 +55,8 @@ python3 setup_seed_feet.py
 ```
 
 After registration, sending an Interest to `/remote_modify/(<arg>)` or `/m_to_feet/(<arg>)` executes the `.ndn` code on the seed server.
+`ndnc` calls this execution endpoint first. Only if the remote call fails does it
+use a cached (or newly fetched) `/function-name/code` source as a local fallback.
 
 ## content_type
 

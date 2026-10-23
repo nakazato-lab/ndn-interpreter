@@ -319,27 +319,11 @@ class Interpreter:
         return str(expr)
 
     async def _call_remote_function(self, func_name: str, ndn_names: list[str]) -> Any:
-        # 1. メモリキャッシュ確認（最速）
-        if func_name in Interpreter._code_cache:
-            return await self._run_cached(func_name, Interpreter._code_cache[func_name], ndn_names)
-
-        # 2. ファイルキャッシュ確認（TTL チェックあり）
-        cached_code = _load_cache(func_name)
-        if cached_code is not None:
-            Interpreter._code_cache[func_name] = cached_code  # メモリにも載せる
-            return await self._run_cached(func_name, cached_code, ndn_names)
-
-        # 3. キャッシュミス: seed から .ndn ソースを取得
-        code = await self._fetch_function_code(func_name)
-        if code is not None:
-            Interpreter._code_cache[func_name] = code  # メモリに保存
-            _save_cache(func_name, code)               # ファイルに保存
-            print(f"[ndnc] cached '{func_name}' (~/.ndnc/cache/)", file=sys.stderr)
-            return await self._run_cached(func_name, code, ndn_names)
-
-        # 4. コード取得失敗: 従来通り seed に実行を委ねる
+        # 1. リモート側で実行する。空の応答も有効な実行結果なので、
+        #    例外時だけローカル実行へフォールバックする。
         args_str = ", ".join(ndn_names)
         interest_name = "/" + func_name + "/(" + args_str + ")"
+        remote_error: Exception
         try:
             _, _, content = await self.app.express_interest(
                 interest_name,
@@ -350,9 +334,34 @@ class Interpreter:
             if content is None:
                 return ""
             return bytes(content).decode('utf-8').strip()
-        except Exception as e:
-            print(f"Error calling remote function '{func_name}': {e}")
-            raise
+        except Exception as error:
+            remote_error = error
+            print(
+                f"[ndnc] remote execution of '{func_name}' failed; "
+                "trying local source fallback",
+                file=sys.stderr,
+            )
+
+        # 2. リモート実行失敗時だけ、既存のソースキャッシュをローカル実行する。
+        if func_name in Interpreter._code_cache:
+            return await self._run_cached(func_name, Interpreter._code_cache[func_name], ndn_names)
+
+        # 3. ファイルキャッシュ確認（TTL チェックあり）
+        cached_code = _load_cache(func_name)
+        if cached_code is not None:
+            Interpreter._code_cache[func_name] = cached_code  # メモリにも載せる
+            return await self._run_cached(func_name, cached_code, ndn_names)
+
+        # 4. キャッシュミス: seed から .ndn ソースを取得してローカル実行する。
+        code = await self._fetch_function_code(func_name)
+        if code is not None:
+            Interpreter._code_cache[func_name] = code  # メモリに保存
+            _save_cache(func_name, code)               # ファイルに保存
+            print(f"[ndnc] cached '{func_name}' (~/.ndnc/cache/)", file=sys.stderr)
+            return await self._run_cached(func_name, code, ndn_names)
+
+        # 5. リモート実行・ローカルフォールバックのどちらもできなかった。
+        raise remote_error
 
     async def _fetch_function_code(self, func_name: str) -> Optional[str]:
         """seed から /func_name/code を取得して .ndn ソースを返す。失敗時は None。"""
