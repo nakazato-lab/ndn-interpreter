@@ -54,7 +54,10 @@ python3 setup_seed_feet.py
 # example output: created: /m_to_feet
 ```
 
-After registration, sending an Interest to `/remote_modify/(<arg>)` or `/m_to_feet/(<arg>)` executes the `.ndn` code on the seed server.
+After registration, `ndnc` sends an Interest in the form `/function/(<args>)`.
+Arguments are evaluated before they are embedded in the Interest name. For
+example, the value fetched by `interest "/capital/japan"` is passed to a
+function as its `arg0`, rather than the NDN name `/capital/japan`.
 `ndnc` calls this execution endpoint first. Only if the remote call fails does it
 use a cached (or newly fetched) `/function-name/code` source as a local fallback.
 

@@ -13,11 +13,7 @@ from ndn.security import KeychainDigest
 logger = logging.getLogger(__name__)
 
 
-def _extract_args(name: FormalName) -> list[str]:
-    """Interest名から引数NDN名リストを抽出する。
-    例: /modify/(/data/ryu-local/) → ["/data/ryu-local/"]
-    ネストした括弧にも対応: /f/(/a, /g/(/b)) → ["/a", "/g/(/b)"]
-    """
+def _extract_args(name: FormalName) -> list[object]:
     decoded = Name.to_str(name)
     decoded = urllib.parse.unquote(decoded)
 
@@ -35,8 +31,19 @@ def _extract_args(name: FormalName) -> list[str]:
     args: list[str] = []
     depth = 0
     seg_start = 0
+    in_string = False
+    escaped = False
     for i, ch in enumerate(args_str):
-        if ch == '(':
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == '(':
             depth += 1
         elif ch == ')':
             depth -= 1
@@ -44,7 +51,15 @@ def _extract_args(name: FormalName) -> list[str]:
             args.append(args_str[seg_start:i].strip())
             seg_start = i + 1
     args.append(args_str[seg_start:].strip())
-    return [a for a in args if a]
+    parsed_args: list[object] = []
+    for arg in args:
+        if not arg:
+            continue
+        try:
+            parsed_args.append(json.loads(arg))
+        except json.JSONDecodeError:
+            parsed_args.append(arg)
+    return parsed_args
 
 
 class SeedServer:
