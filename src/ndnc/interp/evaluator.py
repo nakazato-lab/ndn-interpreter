@@ -2,12 +2,15 @@ from __future__ import annotations
 from typing import Any, Union, Optional
 import asyncio
 import json
+import os
 import time
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 from ndn.app import NDNApp
 from ndn.encoding import Name
 from ndn.security import KeychainDigest
+from ndn.transport.stream_face import TcpFace, UnixFace
 from ..parser.ast import (
 	Program, PrintStatement, ReturnStatement, Assignment, ExprStatement,
 	StringLiteral, NumberLiteral, Variable,
@@ -19,6 +22,22 @@ _LOCAL_FUNCTIONS = {"concat"}
 
 _CACHE_DIR = Path.home() / ".ndnc" / "cache"
 _CACHE_TTL = 300  # seconds
+
+
+class RemoteTcpFace(TcpFace):
+    def isLocalFace(self):
+        return False
+
+
+def make_ndn_app():
+    uri = urlparse(os.environ['NDN_CLIENT_TRANSPORT'])
+    if uri.scheme == 'unix' and uri.path:
+        face = UnixFace(uri.path)
+    elif uri.scheme in ('tcp', 'tcp4', 'tcp6') and uri.hostname:
+        face = RemoteTcpFace(uri.hostname, uri.port or 6363)
+    else:
+        raise ValueError('NDN_CLIENT_TRANSPORT must be unix:///path or tcp://host:port')
+    return NDNApp(face=face, keychain=KeychainDigest())
 
 
 def _cache_path(func_name: str) -> Path:
@@ -76,10 +95,8 @@ class Interpreter:
     # プロセス内で共有するメモリキャッシュ（NDN 名 → 取得済みデータ）
     _interest_cache: dict[str, Any] = {}
 
-    def __init__(self, args: dict[str, str] | None = None):
+    def __init__(self, args: dict[str, Any] | None = None):
         self._env: dict[str, Any] = {}
-        self._env_origin: dict[str, str] = {}  # interest で取得した変数の NDN 名を追跡
-        # 外部から渡された引数を env に事前登録（例: {"arg0": "/data/local/"}）
         if args:
             self._env.update(args)
         self.app: Optional[NDNApp] = None
@@ -92,7 +109,7 @@ class Interpreter:
         if not has_interest:
             return asyncio.run(self._exec_block(program))
 
-        self.app = NDNApp(keychain=KeychainDigest())
+        self.app = make_ndn_app()
         self._register_local_data_routes()
         result = None
         failure = None
@@ -149,14 +166,6 @@ class Interpreter:
     async def _exec_assignment(self, node: Assignment):
         value = await self._eval_expr(node.expr)
         self._env[node.name] = value
-        # interest で取得した変数は NDN 名を記録しておく
-        if isinstance(node.expr, ExpressInterest):
-            if node.expr.name_is_var:
-                # 変数名から実際の NDN 名を解決して記録
-                ndn_name = self._env.get(node.expr.name, "")
-                self._env_origin[node.name] = str(ndn_name)
-            else:
-                self._env_origin[node.name] = node.expr.name
 
     async def _exec_expr_stmt(self, node: ExprStatement):
         value = await self._eval_expr(node.expr)
@@ -237,9 +246,8 @@ class Interpreter:
                 if expr.name == "concat":
                     return "".join(str(v) for v in arg_values)
             elif self.app is not None:
-                # リモート関数: 引数を NDN 名として渡す（ネストした関数呼び出しも再帰的に解決）
-                ndn_names = [self._to_ndn_name(a) for a in expr.args]
-                return await self._call_remote_function(expr.name, ndn_names)
+                arg_values = [await self._eval_expr(a) for a in expr.args]
+                return await self._call_remote_function(expr.name, arg_values)
             else:
                 raise RuntimeError(f"Unknown function: {expr.name}")
 
@@ -287,41 +295,10 @@ class Interpreter:
 
             self.app.route(prefix)(make_handler(val_bytes))
 
-    def _to_ndn_name(self, expr: Expr) -> str:
-        """リモート関数の引数として使う NDN 名を決定する。
-        - ExpressInterest → そのまま NDN 名を返す
-        - Variable → interest 由来なら記録済みの NDN 名、そうでなければ値を NDN 名として扱う
-        - StringLiteral → 先頭 '/' を補完して NDN 名とする"""
-        if isinstance(expr, ExpressInterest):
-            if expr.name_is_var:
-                if expr.name in self._env_origin:
-                    return self._env_origin[expr.name]
-                val = self._env.get(expr.name, "")
-                return str(val) if str(val).startswith('/') else '/' + str(val)
-            return expr.name
-        if isinstance(expr, Variable):
-            if expr.name in self._env_origin:
-                return self._env_origin[expr.name]
-            val = self._env.get(expr.name, "")
-            if isinstance(val, str):
-                return val if val.startswith('/') else '/' + val
-            return str(val)
-        if isinstance(expr, NumberLiteral):
-            return str(expr.value)
-        if isinstance(expr, StringLiteral):
-            val = expr.value
-            return val if val.startswith('/') else '/' + val
-        if isinstance(expr, FunctionCall):
-            if expr.name not in _LOCAL_FUNCTIONS:
-                ndn_names = [self._to_ndn_name(a) for a in expr.args]
-                args_str = ", ".join(ndn_names)
-                return "/" + expr.name + "/(" + args_str + ")"
-        return str(expr)
-
-    async def _call_remote_function(self, func_name: str, ndn_names: list[str]) -> Any:
+    async def _call_remote_function(self, func_name: str, arg_values: list[Any]) -> Any:
         # 1. リモート側で実行する。空の応答も有効な実行結果なので、
         #    例外時だけローカル実行へフォールバックする。
-        args_str = ", ".join(ndn_names)
+        args_str = ", ".join(json.dumps(value, ensure_ascii=False) for value in arg_values)
         interest_name = "/" + func_name + "/(" + args_str + ")"
         remote_error: Exception
         try:
@@ -344,13 +321,13 @@ class Interpreter:
 
         # 2. リモート実行失敗時だけ、既存のソースキャッシュをローカル実行する。
         if func_name in Interpreter._code_cache:
-            return await self._run_cached(func_name, Interpreter._code_cache[func_name], ndn_names)
+            return await self._run_cached(func_name, Interpreter._code_cache[func_name], arg_values)
 
         # 3. ファイルキャッシュ確認（TTL チェックあり）
         cached_code = _load_cache(func_name)
         if cached_code is not None:
             Interpreter._code_cache[func_name] = cached_code  # メモリにも載せる
-            return await self._run_cached(func_name, cached_code, ndn_names)
+            return await self._run_cached(func_name, cached_code, arg_values)
 
         # 4. キャッシュミス: seed から .ndn ソースを取得してローカル実行する。
         code = await self._fetch_function_code(func_name)
@@ -358,7 +335,7 @@ class Interpreter:
             Interpreter._code_cache[func_name] = code  # メモリに保存
             _save_cache(func_name, code)               # ファイルに保存
             print(f"[ndnc] cached '{func_name}' (~/.ndnc/cache/)", file=sys.stderr)
-            return await self._run_cached(func_name, code, ndn_names)
+            return await self._run_cached(func_name, code, arg_values)
 
         # 5. リモート実行・ローカルフォールバックのどちらもできなかった。
         raise remote_error
@@ -379,10 +356,10 @@ class Interpreter:
         except Exception:
             return None
 
-    async def _run_cached(self, func_name: str, code: str, ndn_names: list[str]) -> Any:
+    async def _run_cached(self, func_name: str, code: str, arg_values: list[Any]) -> Any:
         """キャッシュ済み .ndn コードを引数付きでローカル実行する。"""
         from ..parser.parser import parse
-        arg_dict = {f"arg{i}": v for i, v in enumerate(ndn_names)}
+        arg_dict = {f"arg{i}": v for i, v in enumerate(arg_values)}
         program = parse(code)
         interp = Interpreter(args=arg_dict)
         interp.app = self.app

@@ -5,7 +5,7 @@ from ndn.security import KeychainDigest
 
 app = NDNApp(keychain=KeychainDigest())
 
-CODE = 'let meters = interest arg0\nlet result = concat(meters * 3.28084, "ft")\nreturn result'
+CODE = 'let result = concat(arg0 * 3.28084, "ft")\nreturn result'
 
 
 async def main():

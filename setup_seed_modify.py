@@ -5,7 +5,7 @@ from ndn.security import KeychainDigest
 
 app = NDNApp(keychain=KeychainDigest())
 
-CODE = 'let data = interest arg0\nlet result = concat(data, " modified")\nreturn result'
+CODE = 'let result = concat(arg0, " modified")\nreturn result'
 
 
 async def main():
