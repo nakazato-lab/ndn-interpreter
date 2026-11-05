@@ -9,6 +9,7 @@ from typing import Optional
 from ndn.app import NDNApp
 from ndn.encoding import Name, InterestParam, BinaryStr, FormalName
 from ndn.security import KeychainDigest
+from segmented_node_wrapper import SegmentedNodeWrapper
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ class SeedServer:
         self.app = app
         # name → (content, content_type) のマップ
         self.server_map: dict[str, tuple[str, str]] = {}
+        self.publisher = SegmentedNodeWrapper(app, serve=True)
 
     def run(self):
         @self.app.route(self.prefix)
@@ -170,8 +172,13 @@ class SeedServer:
             program = parse(ndn_code)
             interp = Interpreter(args=arg_dict)
             result = await interp.exec_in_context(program, self.app)
-            logger.info(f"Result: {result!r}")
-            self.app.put_data(int_name, content=result.encode(), freshness_period=10000)
+            if isinstance(result, bytes):
+                if result:
+                    await self.publisher.publish(Name.to_str(int_name), result, send_packet=True)
+                else:
+                    self.app.put_data(int_name, content=b'', freshness_period=10000)
+            else:
+                self.app.put_data(int_name, content=result.encode(), freshness_period=10000)
         except Exception as e:
             logger.error(f"Error running .ndn: {e}")
             self.app.put_data(int_name, content=f"error: {e}".encode(), freshness_period=10000)

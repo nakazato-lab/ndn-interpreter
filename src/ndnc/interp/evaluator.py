@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Any, Union, Optional
+from typing import Any, Optional
 import asyncio
 import json
 import os
@@ -8,9 +8,10 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 from ndn.app import NDNApp
-from ndn.encoding import Name
+from ndn.encoding import Name, Component
 from ndn.security import KeychainDigest
 from ndn.transport.stream_face import TcpFace, UnixFace
+from segmented_node_wrapper import SegmentedNodeWrapper
 from ..parser.ast import (
 	Program, PrintStatement, ReturnStatement, Assignment, ExprStatement,
 	StringLiteral, NumberLiteral, Variable,
@@ -18,7 +19,8 @@ from ..parser.ast import (
 )
 
 # ローカルで処理できる関数名のセット
-_LOCAL_FUNCTIONS = {"concat"}
+_LOCAL_FUNCTIONS = {"concat", "put_image"}
+
 
 _CACHE_DIR = Path.home() / ".ndnc" / "cache"
 _CACHE_TTL = 300  # seconds
@@ -95,7 +97,8 @@ class Interpreter:
     # プロセス内で共有するメモリキャッシュ（NDN 名 → 取得済みデータ）
     _interest_cache: dict[str, Any] = {}
 
-    def __init__(self, args: dict[str, Any] | None = None):
+    def __init__(self, args: dict[str, Any] | None = None, base_dir: Path | None = None):
+        self.base_dir = Path(base_dir).resolve() if base_dir is not None else Path.cwd()
         self._env: dict[str, Any] = {}
         if args:
             self._env.update(args)
@@ -155,6 +158,8 @@ class Interpreter:
             elif isinstance(st, Assignment):
                 await self._exec_assignment(st)
             elif isinstance(st, ExprStatement):
+                if isinstance(st.expr, FunctionCall) and st.expr.name == "put_image":
+                    return await self._eval_expr(st.expr)
                 await self._exec_expr_stmt(st)
             else:
                 raise RuntimeError(f"Unsupported node: {st}")
@@ -171,7 +176,16 @@ class Interpreter:
         value = await self._eval_expr(node.expr)
         print(value)
 
-    async def _eval_expr(self, expr: Expr) -> Union[int, str]:
+    async def _read_content(self, name, content: Any) -> str | bytes:
+        if name and Component.get_type(name[-1]) == Component.TYPE_SEGMENT:
+            content = await SegmentedNodeWrapper(self.app).fetch(Name.to_str(name[:-1]), must_be_fresh=True)
+        raw = bytes(content)
+        try:
+            return raw.decode('utf-8').strip()
+        except UnicodeDecodeError:
+            return raw
+
+    async def _eval_expr(self, expr: Expr) -> Any:
         if isinstance(expr, StringLiteral):
             return expr.value
 
@@ -219,7 +233,7 @@ class Interpreter:
 
             # 3. ネットワーク取得
             try:
-                _, _, content = await self.app.express_interest(
+                data_name, _, content = await self.app.express_interest(
                     ndn_name,
                     must_be_fresh=True,
                     can_be_prefix=True,
@@ -227,14 +241,15 @@ class Interpreter:
                 )
                 if content is None:
                     return ""
-                text = bytes(content).decode('utf-8').strip()
+                text = await self._read_content(data_name, content)
                 try:
-                    value = int(text)
+                    value = int(text) if isinstance(text, str) else text
                 except ValueError:
                     value = text
                 Interpreter._interest_cache[ndn_name] = value
-                _save_interest_cache(ndn_name, value)
-                print(f"[ndnc] cached interest '{ndn_name}' (~/.ndnc/cache/)", file=sys.stderr)
+                if not isinstance(value, bytes):
+                    _save_interest_cache(ndn_name, value)
+                    print(f"[ndnc] cached interest '{ndn_name}' (~/.ndnc/cache/)", file=sys.stderr)
                 return value
             except Exception as e:
                 print(f"Error expressing interest for {expr.name}: {e}")
@@ -245,6 +260,14 @@ class Interpreter:
                 arg_values = [await self._eval_expr(a) for a in expr.args]
                 if expr.name == "concat":
                     return "".join(str(v) for v in arg_values)
+                if expr.name == "put_image":
+                    if len(arg_values) != 1 or not isinstance(arg_values[0], str):
+                        raise RuntimeError("put_image expects exactly one string path")
+                    path = self.base_dir / arg_values[0]
+                    try:
+                        return path.read_bytes()
+                    except OSError as exc:
+                        raise RuntimeError(f"put_image could not read '{path}': {exc}") from exc
             elif self.app is not None:
                 arg_values = [await self._eval_expr(a) for a in expr.args]
                 return await self._call_remote_function(expr.name, arg_values)
@@ -302,15 +325,12 @@ class Interpreter:
         interest_name = "/" + func_name + "/(" + args_str + ")"
         remote_error: Exception
         try:
-            _, _, content = await self.app.express_interest(
+            data_name, _, content = await self.app.express_interest(
                 interest_name,
                 must_be_fresh=True,
-                can_be_prefix=False,
+                can_be_prefix=True,
                 lifetime=20000,
             )
-            if content is None:
-                return ""
-            return bytes(content).decode('utf-8').strip()
         except Exception as error:
             remote_error = error
             print(
@@ -318,6 +338,10 @@ class Interpreter:
                 "trying local source fallback",
                 file=sys.stderr,
             )
+        else:
+            if content is None:
+                return ""
+            return await self._read_content(data_name, content)
 
         # 2. リモート実行失敗時だけ、既存のソースキャッシュをローカル実行する。
         if func_name in Interpreter._code_cache:
@@ -361,14 +385,14 @@ class Interpreter:
         from ..parser.parser import parse
         arg_dict = {f"arg{i}": v for i, v in enumerate(arg_values)}
         program = parse(code)
-        interp = Interpreter(args=arg_dict)
+        interp = Interpreter(args=arg_dict, base_dir=self.base_dir)
         interp.app = self.app
         return await interp._exec_block(program)
 
-    async def exec_in_context(self, program: Program, app: NDNApp) -> str:
-        """既存の NDNApp 内で実行し、return の値を文字列で返す。print は表示のみ。
+    async def exec_in_context(self, program: Program, app: NDNApp) -> str | bytes:
+        """既存の NDNApp 内で実行し、結果を文字列またはバイト列で返す。print は表示のみ。
         seed サーバーなど、すでにイベントループが動いている環境から呼び出す用途向け。
         通常の run() と異なり、新たなイベントループや NDNApp を起動しない。"""
         self.app = app
         result = await self._exec_block(program)
-        return '' if result is None else str(result)
+        return result if isinstance(result, bytes) else ('' if result is None else str(result))
