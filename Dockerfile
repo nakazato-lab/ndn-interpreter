@@ -2,5 +2,5 @@ FROM python:3.10-slim
 WORKDIR /app
 RUN apt-get update && apt-get install -y make time && rm -rf /var/lib/apt/lists/*
 COPY . .
-RUN pip install .
+RUN pip install -r seed/requirements.txt .
 CMD ["ndnc", "--help"]
