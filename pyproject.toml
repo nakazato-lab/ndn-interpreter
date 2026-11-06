@@ -14,7 +14,8 @@
     requires-python = ">=3.10"
     dependencies = [
         "lark==1.1.9",
-        "python-ndn"
+        "python-ndn",
+        "segmented-node-wrapper @ https://github.com/nakazato-lab/segmented-node-wrapper/archive/46454ca3df3f2add461b77e20c0627c27a0d90e7.zip"
     ]
     keywords = ["ndn", "dsl", "distributed", "icn"]
     classifiers = [
