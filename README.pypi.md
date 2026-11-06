@@ -72,7 +72,8 @@ request fails, `ndnc` falls back to locally executing a cached (or newly fetched
 
 Use `return` to produce a function result. It stops execution of the current
 script/function. `print` writes to stdout only and is never used as the result.
-Without a `return`, the result is `None` (an empty response over the text NDN/gRPC interface).
+Without a `return` or a standalone `put_image(...)`, the result is `None`
+(an empty response over the text NDN/gRPC interface).
 
 Function (`average.ndn`):
 
@@ -104,3 +105,15 @@ from 0.0.6 to 0.0.7. Publish that version before building the function runtime a
 invoker images pinned to 0.0.7; deploy both images before registering scripts using
 `return`. Source-cache entries from before the migration may remain until their
 TTL expires (300 seconds).
+
+## Returning an image
+
+```ndn
+put_image("sample.png")
+```
+
+Returns the image and stops execution. Relative paths use the script directory.
+The image must already exist on the producer.
+
+Save a result with `ndnc run --output received.png script.ndn`.
+Consumer scripts should use `return interest "/print_image"` to return the image.
