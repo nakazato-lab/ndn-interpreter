@@ -5,6 +5,7 @@ import json
 import os
 import time
 import sys
+from uuid import uuid4
 from pathlib import Path
 from urllib.parse import urlparse
 from ndn.app import NDNApp
@@ -12,6 +13,7 @@ from ndn.encoding import Name, Component
 from ndn.security import KeychainDigest
 from ndn.transport.stream_face import TcpFace, UnixFace
 from segmented_node_wrapper import SegmentedNodeWrapper
+from ..ndn_routing import RoutedNDNApp
 from ..parser.ast import (
 	Program, PrintStatement, ReturnStatement, Assignment, ExprStatement,
 	StringLiteral, NumberLiteral, Variable,
@@ -39,7 +41,7 @@ def make_ndn_app():
         face = RemoteTcpFace(uri.hostname, uri.port or 6363)
     else:
         raise ValueError('NDN_CLIENT_TRANSPORT must be unix:///path or tcp://host:port')
-    return NDNApp(face=face, keychain=KeychainDigest())
+    return RoutedNDNApp(face=face, keychain=KeychainDigest())
 
 
 def _cache_path(func_name: str) -> Path:
@@ -103,6 +105,7 @@ class Interpreter:
         if args:
             self._env.update(args)
         self.app: Optional[NDNApp] = None
+        self._argument_publisher = None
         self._local_data: dict[str, str] = {
             '/data/local/': 'data from local',
         }
@@ -321,12 +324,30 @@ class Interpreter:
     async def _call_remote_function(self, func_name: str, arg_values: list[Any]) -> Any:
         # 1. リモート側で実行する。空の応答も有効な実行結果なので、
         #    例外時だけローカル実行へフォールバックする。
-        args_str = ", ".join(json.dumps(value, ensure_ascii=False) for value in arg_values)
+        wire_args = []
+        parameters = {}
+        for value in arg_values:
+            if isinstance(value, bytes):
+                if 'image_ref' in parameters:
+                    raise ValueError('Only one image argument can be passed through stdin')
+                prefix = '/image/arg/' + uuid4().hex
+                if self._argument_publisher is None:
+                    self._argument_publisher = SegmentedNodeWrapper(self.app, serve=True)
+                reference = await self._argument_publisher.publish(prefix, value)
+                parameters['image_ref'] = reference
+                wire_args.append(reference)
+            else:
+                wire_args.append(value)
+        args_str = ", ".join(json.dumps(value, ensure_ascii=False) for value in wire_args)
+        # Image arguments use an Interest name such as /compress_image/("/image/arg/<UUID>").
+        # Fetch the image using image_ref in ApplicationParameters.
         interest_name = "/" + func_name + "/(" + args_str + ")"
+        app_param = json.dumps(parameters).encode('utf-8') if parameters else None
         remote_error: Exception
         try:
             data_name, _, content = await self.app.express_interest(
                 interest_name,
+                app_param=app_param,
                 must_be_fresh=True,
                 can_be_prefix=True,
                 lifetime=20000,
@@ -341,6 +362,15 @@ class Interpreter:
         else:
             if content is None:
                 return ""
+            # Function returns {"image_ref": "..."} instead of the resulting image.
+            # The compiler fetches the image using SegmentedNodeWrapper.
+            if parameters and content:
+                try:
+                    response = json.loads(bytes(content))
+                except ValueError:
+                    response = None
+                if isinstance(response, dict) and response.get('image_ref'):
+                    return await SegmentedNodeWrapper(self.app).fetch(response['image_ref'], must_be_fresh=True)
             return await self._read_content(data_name, content)
 
         # 2. リモート実行失敗時だけ、既存のソースキャッシュをローカル実行する。
