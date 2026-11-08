@@ -330,7 +330,8 @@ class Interpreter:
             if isinstance(value, bytes):
                 if 'image_ref' in parameters:
                     raise ValueError('Only one image argument can be passed through stdin')
-                prefix = '/image/arg/' + uuid4().hex
+                # Reuse the pre-advertised router prefix instead of waiting for a new route.
+                prefix = os.environ['NDN_ROUTER_PREFIX'].rstrip('/') + '/image/arg/' + uuid4().hex
                 if self._argument_publisher is None:
                     self._argument_publisher = SegmentedNodeWrapper(self.app, serve=True)
                 reference = await self._argument_publisher.publish(prefix, value)
@@ -339,7 +340,7 @@ class Interpreter:
             else:
                 wire_args.append(value)
         args_str = ", ".join(json.dumps(value, ensure_ascii=False) for value in wire_args)
-        # Image arguments use an Interest name such as /compress_image/("/image/arg/<UUID>").
+        # Image arguments use an Interest name such as /compress_image/("/<router>/image/arg/<UUID>").
         # Fetch the image using image_ref in ApplicationParameters.
         interest_name = "/" + func_name + "/(" + args_str + ")"
         app_param = json.dumps(parameters).encode('utf-8') if parameters else None
