@@ -253,6 +253,8 @@ class Interpreter:
                 with tracer.start_as_current_span('ndnc.interest', kind=trace.SpanKind.CLIENT,
                                                  attributes={'ndn.name': ndn_name}):
                     parameters = {}
+                    # Inject the current span's traceparent and optional tracestate into ApplicationParameters
+                    # so the Sidecar in the Function Pod can continue the same trace.
                     TraceContextTextMapPropagator().inject(parameters)
                     _, _, content = await self.app.express_interest(
                         ndn_name,
