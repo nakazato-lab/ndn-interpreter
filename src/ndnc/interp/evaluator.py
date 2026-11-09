@@ -9,10 +9,10 @@ from uuid import uuid4
 from pathlib import Path
 from urllib.parse import urlparse
 from ndn.app import NDNApp
-from ndn.encoding import Name, Component
 from ndn.security import KeychainDigest
 from ndn.transport.stream_face import TcpFace, UnixFace
 from opentelemetry import trace
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from segmented_node_wrapper import SegmentedNodeWrapper
 from ..ndn_routing import RoutedNDNApp
 from ..parser.ast import (
@@ -181,10 +181,19 @@ class Interpreter:
         value = await self._eval_expr(node.expr)
         print(value)
 
-    async def _read_content(self, name, content: Any) -> str | bytes:
-        if name and Component.get_type(name[-1]) == Component.TYPE_SEGMENT:
-            with tracer.start_as_current_span('ndnc.fetch.content', attributes={'ndn.name': Name.to_str(name[:-1])}):
-                content = await SegmentedNodeWrapper(self.app).fetch(Name.to_str(name[:-1]), must_be_fresh=True)
+    async def _read_content(self, content: Any) -> str | bytes:
+        # Function returns a reference; the wrapper fetches the complete result.
+        try:
+            response = json.loads(bytes(content))
+        except ValueError:
+            response = None
+        if isinstance(response, dict):
+            reference = response.get('image_ref') or response.get('result_ref')
+            if reference:
+                with tracer.start_as_current_span('ndnc.fetch.result', attributes={'ndn.name': reference}):
+                    content = await SegmentedNodeWrapper(self.app).fetch(reference, must_be_fresh=True)
+                if response.get('image_ref'):
+                    return bytes(content)
         raw = bytes(content)
         try:
             return raw.decode('utf-8').strip()
@@ -243,15 +252,18 @@ class Interpreter:
             try:
                 with tracer.start_as_current_span('ndnc.interest', kind=trace.SpanKind.CLIENT,
                                                  attributes={'ndn.name': ndn_name}):
-                    data_name, _, content = await self.app.express_interest(
+                    parameters = {}
+                    TraceContextTextMapPropagator().inject(parameters)
+                    _, _, content = await self.app.express_interest(
                         ndn_name,
+                        app_param=json.dumps(parameters).encode('utf-8') if parameters else None,
                         must_be_fresh=True,
                         can_be_prefix=True,
                         lifetime=6000
                     )
                 if content is None:
                     return ""
-                text = await self._read_content(data_name, content)
+                text = await self._read_content(content)
                 try:
                     value = int(text) if isinstance(text, str) else text
                 except ValueError:
@@ -354,14 +366,15 @@ class Interpreter:
         # Image arguments use an Interest name such as /compress_image/("/<router>/image/arg/<UUID>").
         # Fetch the image using image_ref in ApplicationParameters.
         interest_name = "/" + func_name + "/(" + args_str + ")"
-        app_param = json.dumps(parameters).encode('utf-8') if parameters else None
         remote_error: Exception
         try:
             with tracer.start_as_current_span('ndnc.function.request', kind=trace.SpanKind.CLIENT,
                                              attributes={'ndn.function.name': func_name, 'ndn.name': interest_name}):
-                data_name, _, content = await self.app.express_interest(
+                # Carry this request span to the Sidecar through ApplicationParameters.
+                TraceContextTextMapPropagator().inject(parameters)
+                _, _, content = await self.app.express_interest(
                     interest_name,
-                    app_param=app_param,
+                    app_param=json.dumps(parameters).encode('utf-8') if parameters else None,
                     must_be_fresh=True,
                     can_be_prefix=True,
                     lifetime=20000,
@@ -376,17 +389,7 @@ class Interpreter:
         else:
             if content is None:
                 return ""
-            # Function returns {"image_ref": "..."} instead of the resulting image.
-            # The compiler fetches the image using SegmentedNodeWrapper.
-            if parameters and content:
-                try:
-                    response = json.loads(bytes(content))
-                except ValueError:
-                    response = None
-                if isinstance(response, dict) and response.get('image_ref'):
-                    with tracer.start_as_current_span('ndnc.fetch.result', attributes={'ndn.name': response['image_ref']}):
-                        return await SegmentedNodeWrapper(self.app).fetch(response['image_ref'], must_be_fresh=True)
-            return await self._read_content(data_name, content)
+            return await self._read_content(content)
 
         # 2. リモート実行失敗時だけ、既存のソースキャッシュをローカル実行する。
         if func_name in Interpreter._code_cache:
