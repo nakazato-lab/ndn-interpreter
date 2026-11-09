@@ -12,6 +12,7 @@ from ndn.app import NDNApp
 from ndn.encoding import Name, Component
 from ndn.security import KeychainDigest
 from ndn.transport.stream_face import TcpFace, UnixFace
+from opentelemetry import trace
 from segmented_node_wrapper import SegmentedNodeWrapper
 from ..ndn_routing import RoutedNDNApp
 from ..parser.ast import (
@@ -22,6 +23,7 @@ from ..parser.ast import (
 
 # ローカルで処理できる関数名のセット
 _LOCAL_FUNCTIONS = {"concat", "put_image"}
+tracer = trace.get_tracer(__name__)
 
 
 _CACHE_DIR = Path.home() / ".ndnc" / "cache"
@@ -181,7 +183,8 @@ class Interpreter:
 
     async def _read_content(self, name, content: Any) -> str | bytes:
         if name and Component.get_type(name[-1]) == Component.TYPE_SEGMENT:
-            content = await SegmentedNodeWrapper(self.app).fetch(Name.to_str(name[:-1]), must_be_fresh=True)
+            with tracer.start_as_current_span('ndnc.fetch.content', attributes={'ndn.name': Name.to_str(name[:-1])}):
+                content = await SegmentedNodeWrapper(self.app).fetch(Name.to_str(name[:-1]), must_be_fresh=True)
         raw = bytes(content)
         try:
             return raw.decode('utf-8').strip()
@@ -226,22 +229,26 @@ class Interpreter:
 
             # 1. メモリキャッシュ確認
             if ndn_name in Interpreter._interest_cache:
+                trace.get_current_span().add_event('ndnc.cache.hit', {'ndn.name': ndn_name, 'cache.type': 'memory'})
                 return Interpreter._interest_cache[ndn_name]
 
             # 2. ファイルキャッシュ確認
             file_cached = _load_interest_cache(ndn_name)
             if file_cached is not None:
+                trace.get_current_span().add_event('ndnc.cache.hit', {'ndn.name': ndn_name, 'cache.type': 'file'})
                 Interpreter._interest_cache[ndn_name] = file_cached
                 return file_cached
 
             # 3. ネットワーク取得
             try:
-                data_name, _, content = await self.app.express_interest(
-                    ndn_name,
-                    must_be_fresh=True,
-                    can_be_prefix=True,
-                    lifetime=6000
-                )
+                with tracer.start_as_current_span('ndnc.interest', kind=trace.SpanKind.CLIENT,
+                                                 attributes={'ndn.name': ndn_name}):
+                    data_name, _, content = await self.app.express_interest(
+                        ndn_name,
+                        must_be_fresh=True,
+                        can_be_prefix=True,
+                        lifetime=6000
+                    )
                 if content is None:
                     return ""
                 text = await self._read_content(data_name, content)
@@ -321,7 +328,9 @@ class Interpreter:
 
             self.app.route(prefix)(make_handler(val_bytes))
 
+    @tracer.start_as_current_span('ndnc.function.call')
     async def _call_remote_function(self, func_name: str, arg_values: list[Any]) -> Any:
+        trace.get_current_span().set_attribute('ndn.function.name', func_name)
         # 1. リモート側で実行する。空の応答も有効な実行結果なので、
         #    例外時だけローカル実行へフォールバックする。
         wire_args = []
@@ -334,7 +343,9 @@ class Interpreter:
                 prefix = os.environ['NDN_ROUTER_PREFIX'].rstrip('/') + '/image/arg/' + uuid4().hex
                 if self._argument_publisher is None:
                     self._argument_publisher = SegmentedNodeWrapper(self.app, serve=True)
-                reference = await self._argument_publisher.publish(prefix, value)
+                with tracer.start_as_current_span('ndnc.publish.argument', attributes={
+                        'ndn.name': prefix, 'ndn.content.bytes': len(value)}):
+                    reference = await self._argument_publisher.publish(prefix, value)
                 parameters['image_ref'] = reference
                 wire_args.append(reference)
             else:
@@ -346,13 +357,15 @@ class Interpreter:
         app_param = json.dumps(parameters).encode('utf-8') if parameters else None
         remote_error: Exception
         try:
-            data_name, _, content = await self.app.express_interest(
-                interest_name,
-                app_param=app_param,
-                must_be_fresh=True,
-                can_be_prefix=True,
-                lifetime=20000,
-            )
+            with tracer.start_as_current_span('ndnc.function.request', kind=trace.SpanKind.CLIENT,
+                                             attributes={'ndn.function.name': func_name, 'ndn.name': interest_name}):
+                data_name, _, content = await self.app.express_interest(
+                    interest_name,
+                    app_param=app_param,
+                    must_be_fresh=True,
+                    can_be_prefix=True,
+                    lifetime=20000,
+                )
         except Exception as error:
             remote_error = error
             print(
@@ -371,7 +384,8 @@ class Interpreter:
                 except ValueError:
                     response = None
                 if isinstance(response, dict) and response.get('image_ref'):
-                    return await SegmentedNodeWrapper(self.app).fetch(response['image_ref'], must_be_fresh=True)
+                    with tracer.start_as_current_span('ndnc.fetch.result', attributes={'ndn.name': response['image_ref']}):
+                        return await SegmentedNodeWrapper(self.app).fetch(response['image_ref'], must_be_fresh=True)
             return await self._read_content(data_name, content)
 
         # 2. リモート実行失敗時だけ、既存のソースキャッシュをローカル実行する。
