@@ -296,7 +296,7 @@ class Interpreter:
                 arg_values = []
                 for argument in expr.args:
                     if isinstance(argument, ExpressInterest):
-                        # Let the remote Sidecar fetch a directly nested Interest argument.
+                        # Add the Interest name to arg_values as an ExpressInterest without executing it first.
                         name = (str(await self._eval_expr(Variable(argument.name)))
                                 if argument.name_is_var else argument.name)
                         arg_values.append(ExpressInterest('/' + name.lstrip('/')))
@@ -373,6 +373,7 @@ class Interpreter:
             else:
                 wire_args.append(value)
         # ExpressInterest("/print_image") -> /compress_image/(/print_image)
+        # json.dumps() wraps string arguments in double quotes.
         args_str = ", ".join(value.name if isinstance(value, ExpressInterest)
                              else json.dumps(value, ensure_ascii=False) for value in wire_args)
         interest_name = "/" + func_name + "/(" + args_str + ")"
