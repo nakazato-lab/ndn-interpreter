@@ -293,7 +293,15 @@ class Interpreter:
                     except OSError as exc:
                         raise RuntimeError(f"put_image could not read '{path}': {exc}") from exc
             elif self.app is not None:
-                arg_values = [await self._eval_expr(a) for a in expr.args]
+                arg_values = []
+                for argument in expr.args:
+                    if isinstance(argument, ExpressInterest):
+                        # Let the remote Sidecar fetch a directly nested Interest argument.
+                        name = (str(await self._eval_expr(Variable(argument.name)))
+                                if argument.name_is_var else argument.name)
+                        arg_values.append(ExpressInterest('/' + name.lstrip('/')))
+                    else:
+                        arg_values.append(await self._eval_expr(argument))
                 return await self._call_remote_function(expr.name, arg_values)
             else:
                 raise RuntimeError(f"Unknown function: {expr.name}")
@@ -364,9 +372,9 @@ class Interpreter:
                 wire_args.append(reference)
             else:
                 wire_args.append(value)
-        args_str = ", ".join(json.dumps(value, ensure_ascii=False) for value in wire_args)
-        # Image arguments use an Interest name such as /compress_image/("/<router>/image/arg/<UUID>").
-        # Fetch the image using image_ref in ApplicationParameters.
+        # ExpressInterest("/print_image") -> /compress_image/(/print_image)
+        args_str = ", ".join(value.name if isinstance(value, ExpressInterest)
+                             else json.dumps(value, ensure_ascii=False) for value in wire_args)
         interest_name = "/" + func_name + "/(" + args_str + ")"
         remote_error: Exception
         try:
@@ -433,6 +441,9 @@ class Interpreter:
     async def _run_cached(self, func_name: str, code: str, arg_values: list[Any]) -> Any:
         """キャッシュ済み .ndn コードを引数付きでローカル実行する。"""
         from ..parser.parser import parse
+        # Resolve deferred arguments here only when execution falls back to local source.
+        arg_values = [await self._eval_expr(value) if isinstance(value, ExpressInterest) else value
+                      for value in arg_values]
         arg_dict = {f"arg{i}": v for i, v in enumerate(arg_values)}
         program = parse(code)
         interp = Interpreter(args=arg_dict, base_dir=self.base_dir)
