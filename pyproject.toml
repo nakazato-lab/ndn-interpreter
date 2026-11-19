@@ -28,6 +28,9 @@
         "Topic :: Software Development :: Interpreters",
     ]
 
+[project.optional-dependencies]
+    grpc = ["grpcio>=1.71.0", "protobuf>=5.29.0"]
+
 [project.urls]
     Homepage = "https://github.com/tryuuu/ndn-compiler"
     Repository = "https://github.com/tryuuu/ndn-compiler"
@@ -37,3 +40,4 @@
 
 [tool.setuptools.package-data]
 "ndnc.parser" = ["*.lark"]
+"ndnc.grpc" = ["*.proto"]

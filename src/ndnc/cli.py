@@ -1,5 +1,7 @@
 from __future__ import annotations
 import argparse
+import asyncio
+import logging
 import base64
 import json
 import os
@@ -52,7 +54,10 @@ def main():
     ap_run.add_argument("ndn_args", nargs="*", metavar="ARG",
                         help="NDN names passed as arg0, arg1, ... to the script")
 
-    ap_serve = sub.add_parser("serve", help="Start NDN server (producer)")
+    ap_serve = sub.add_parser("serve", help="Start an NDN producer or persistent gRPC function server")
+    ap_serve.add_argument("source", type=Path, nargs="?", help="Function source served over gRPC")
+    ap_serve.add_argument("--grpc", action="store_true", help="Serve a function over gRPC")
+    ap_serve.add_argument("--port", type=int, default=50051, help="gRPC listen port")
 
     args = ap.parse_args()
 
@@ -71,7 +76,16 @@ def main():
                     result = {"encoding": "base64", "data": base64.b64encode(result).decode("ascii")}
                 args.result_file.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
     elif args.cmd == "serve":
-        Server().run()
+        if args.grpc:
+            if args.source is None:
+                ap.error("serve --grpc requires a function source")
+            from .grpc_server import serve
+            logging.basicConfig(level=logging.INFO)
+            asyncio.run(serve(args.port, args.source))
+        else:
+            if args.source is not None:
+                ap.error("a function source requires --grpc")
+            Server().run()
 
 
 if __name__ == "__main__":
