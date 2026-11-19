@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package ndnc;
+
+service Interpreter {
+  rpc Execute (ExecutionRequest) returns (ExecutionResult);
+}
+
+message ExecutionRequest {
+  repeated string args = 1;
+}
+
+message ExecutionResult {
+  oneof value {
+    string text = 1;
+    bytes binary = 2;
+  }
+}
