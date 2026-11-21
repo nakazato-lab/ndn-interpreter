@@ -18,15 +18,20 @@ LOG = logging.getLogger(__name__)
 
 class InterpreterService(interpreter_pb2_grpc.InterpreterServicer):
     def __init__(self, source):
-        source = Path(source).resolve()
-        self.program = DeployedFunction.load(source.read_text(encoding='utf-8'), source)
+        self.source = Path(source).resolve()
+        self.program = None
 
     async def Execute(self, request, context):
         parent = TraceContextTextMapPropagator().extract(
             dict(context.invocation_metadata()), context=Context())
         with trace.get_tracer(__name__).start_as_current_span(
                 'ndnc.execute', context=parent, kind=trace.SpanKind.SERVER):
+            # Check whether a regular file exists at this path.
+            if self.program is None and not self.source.is_file():
+                await context.abort(grpc.StatusCode.FAILED_PRECONDITION, 'Function source has not been deployed')
             try:
+                if self.program is None:
+                    self.program = DeployedFunction.load(self.source.read_text(encoding='utf-8'), self.source)
                 result = await asyncio.wait_for(
                     self.program.execute(list(request.args)), timeout=context.time_remaining())
                 if isinstance(result, bytes):
